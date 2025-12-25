@@ -2,146 +2,157 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
+import time
 
 # --- 页面配置 ---
 st.set_page_config(page_title="卖Put年化收益计算器", page_icon="💰", layout="wide")
 
-# --- 侧边栏设置 ---
-st.sidebar.header("⚙️ 参数设置")
-ticker = st.sidebar.text_input("股票代码 (美股)", value="NVDA").upper().strip()
-
-# 新增：价格选择逻辑
-st.sidebar.subheader("💰 计算逻辑")
-price_basis = st.sidebar.radio(
-    "权利金价格基准",
-    options=["买一价 (Bid) - 保守/推荐", "最新价 (Last) - 市场成交", "卖一价 (Ask) - 乐观/挂单"],
-    index=0,
-    help="作为期权卖方(Seller)，'Bid'是你立刻能卖出的价格；'Last'是最近一笔成交价；'Ask'是买方要价，你通常很难以此价格立刻成交。"
-)
-
-# 筛选条件
-st.sidebar.subheader("🔍 筛选过滤")
-min_annualized_return = st.sidebar.slider("最低目标年化收益 (%)", 0, 100, 15)
-min_safety_margin = st.sidebar.slider("最低安全边际/跌幅保护 (%)", 0, 50, 10)
-show_otm_only = st.sidebar.checkbox("只显示价外期权 (OTM)", value=True)
-
-st.title("💰 美股 Put 卖方年化收益计算器")
-st.markdown("实时获取期权链数据，支持多维度价格模型计算。")
-
-# --- 核心逻辑 ---
-if ticker:
+# --- 缓存函数：核心防封锁逻辑 ---
+# ttl=300 表示缓存 300秒 (5分钟)。在这5分钟内，无论怎么调参数，都不会重新请求雅虎。
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_option_data(ticker_symbol):
     try:
-        with st.spinner(f"正在拉取 {ticker} 的数据..."):
-            stock = yf.Ticker(ticker)
-            
-            # 获取股价
-            info = stock.info
-            current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-            
-            if not current_price:
-                st.error("❌ 无法获取当前股价，请检查代码。")
-                st.stop()
-
-            # 显示当前行情
-            col1, col2, col3 = st.columns(3)
-            col1.metric("当前股价", f"${current_price:.2f}")
-            
-            # 确定要使用的价格列名
-            if "Bid" in price_basis:
-                target_price_col = 'bid'
-                display_premium_col = '权利金(Bid)'
-            elif "Last" in price_basis:
-                target_price_col = 'lastPrice'
-                display_premium_col = '权利金(Last)'
-            else:
-                target_price_col = 'ask'
-                display_premium_col = '权利金(Ask)'
-            
-            col2.metric("计算基准", display_premium_col)
-
-            # 获取期权到期日
-            expirations = stock.options
-            if not expirations:
-                st.error("未找到期权数据。")
-                st.stop()
-            
-            # 默认选择最近的3个日期
-            default_exp = expirations[:3] if len(expirations) >= 3 else expirations
-            selected_dates = st.multiselect(
-                "📅 选择到期日", 
-                options=expirations,
-                default=default_exp
-            )
-
-            if not selected_dates:
-                st.warning("请至少选择一个到期日。")
-                st.stop()
-
-            all_puts = []
-            progress_bar = st.progress(0)
-            
-            for i, date in enumerate(selected_dates):
-                progress_bar.progress((i + 1) / len(selected_dates))
+        stock = yf.Ticker(ticker_symbol)
+        
+        # 1. 获取股价 (增加重试机制)
+        # 尝试多次获取价格，因为有时候网络波动
+        current_price = None
+        for key in ['currentPrice', 'regularMarketPrice', 'previousClose', 'open']:
+            try:
+                val = stock.info.get(key)
+                if val:
+                    current_price = val
+                    break
+            except:
+                continue
                 
+        if not current_price:
+            return None, "无法获取当前股价，可能是代码错误或雅虎接口波动。"
+
+        # 2. 获取到期日
+        expirations = stock.options
+        if not expirations:
+            return None, "未找到期权链数据。"
+
+        # 默认只抓取最近 3 个到期日，减少数据量，降低被封概率
+        target_expirations = expirations[:3]
+        
+        all_puts_raw = []
+        
+        for date in target_expirations:
+            try:
                 # 获取期权链
                 opt = stock.option_chain(date)
                 puts = opt.puts
                 
-                # 计算 DTE
+                # 添加日期信息
+                puts['expiration'] = date
                 exp_dt = datetime.strptime(date, "%Y-%m-%d")
                 dte = (exp_dt - datetime.now()).days
-                if dte <= 0: dte = 1 
+                if dte <= 0: dte = 1
+                puts['dte'] = dte
                 
-                # 1. 过滤 Strike
-                if show_otm_only:
-                    puts = puts[puts['strike'] < current_price]
-                else:
-                    puts = puts[(puts['strike'] > current_price * 0.7) & (puts['strike'] < current_price * 1.1)]
+                # 预先筛选：只保留稍微靠谱的数据 (Strike 在 0.5倍 到 1.2倍股价之间)
+                # 这样可以减少后续处理的数据量
+                puts = puts[(puts['strike'] > current_price * 0.5) & (puts['strike'] < current_price * 1.2)]
+                
+                all_puts_raw.append(puts)
+                
+                # 稍微暂停 0.1 秒，温柔一点，避免被判定为攻击
+                time.sleep(0.1) 
+                
+            except Exception:
+                continue # 如果某一天的数据抓取失败，跳过，继续抓下一天
 
-                # 2. 获取权利金 (根据用户选择)
-                # 处理异常值：如果数据缺失，填0
-                puts['premium'] = puts[target_price_col].fillna(0)
-                
-                # 特殊处理：如果是选Bid且Bid为0（可能休市或无流动性），虽然真实，但为了避免误解，也可以不显示或标红
-                # 这里我们保持原样计算，收益率会是0
-                
-                # 3. 计算指标
-                puts['Annualized Return %'] = (puts['premium'] / puts['strike']) * (365 / dte) * 100
-                puts['Safety Margin %'] = ((current_price - puts['strike']) / current_price) * 100
-                puts['Break Even'] = puts['strike'] - puts['premium']
-                
-                # 辅助列
-                puts['Expiration'] = date
-                puts['DTE'] = dte
-                
-                # 4. 筛选
-                puts = puts[puts['Annualized Return %'] >= min_annualized_return]
-                puts = puts[puts['Safety Margin %'] >= min_safety_margin]
+        if not all_puts_raw:
+            return None, "没有获取到有效的期权数据。"
 
-                # 选取展示列
-                # 注意：这里我们把成交量和未平仓也加上，方便判断流动性
-                display_cols = ['Expiration', 'DTE', 'strike', 'premium', 'Annualized Return %', 'Safety Margin %', 'Break Even', 'volume', 'openInterest']
+        final_df = pd.concat(all_puts_raw)
+        return final_df, current_price
+
+    except Exception as e:
+        return None, f"数据抓取严重错误: {str(e)}"
+
+# --- 侧边栏 ---
+st.sidebar.header("⚙️ 参数设置")
+ticker = st.sidebar.text_input("股票代码 (美股)", value="NVDA").upper().strip()
+
+st.sidebar.subheader("💰 计算基准")
+price_basis = st.sidebar.radio(
+    "权利金价格",
+    options=["买一价 (Bid)", "最新价 (Last)", "卖一价 (Ask)"],
+    index=0
+)
+
+st.sidebar.subheader("🔍 筛选过滤")
+min_annualized_return = st.sidebar.slider("最低年化收益 (%)", 0, 100, 15)
+min_safety_margin = st.sidebar.slider("最低安全边际 (%)", 0, 50, 10)
+show_otm_only = st.sidebar.checkbox("只显示价外 (OTM)", value=True)
+
+# 强制刷新按钮
+if st.sidebar.button("🔄 强制刷新数据"):
+    st.cache_data.clear()
+
+# --- 主界面 ---
+st.title("💰 美股 Put 卖方计算器 (防封版)")
+
+if ticker:
+    with st.spinner(f"正在从雅虎财经拉取 {ticker} 数据... (缓存有效期5分钟)"):
+        # 调用缓存函数
+        raw_df, price_info = fetch_option_data(ticker)
+        
+        if isinstance(price_info, str): # 如果返回的是错误信息
+            st.error(f"❌ {price_info}")
+            if "Too Many Requests" in price_info or "Rate limited" in str(price_info):
+                st.warning("⚠️ 雅虎财经限制了访问频率。建议：\n1. 等待几分钟再试。\n2. 尝试换一个冷门的股票代码测试。\n3. 如果持续报错，建议在本地电脑运行此脚本。")
+        else:
+            current_price = price_info
+            
+            # --- 数据处理逻辑 (在缓存数据基础上进行计算) ---
+            # 1. 确定价格列
+            if "Bid" in price_basis:
+                p_col = 'bid'
+                disp_col = '权利金(Bid)'
+            elif "Last" in price_basis:
+                p_col = 'lastPrice'
+                disp_col = '权利金(Last)'
+            else:
+                p_col = 'ask'
+                disp_col = '权利金(Ask)'
+            
+            df = raw_df.copy()
+            
+            # 2. 过滤 OTM
+            if show_otm_only:
+                df = df[df['strike'] < current_price]
+            
+            # 3. 计算
+            df['premium'] = df[p_col].fillna(0)
+            df['Annualized Return %'] = (df['premium'] / df['strike']) * (365 / df['dte']) * 100
+            df['Safety Margin %'] = ((current_price - df['strike']) / current_price) * 100
+            df['Break Even'] = df['strike'] - df['premium']
+            
+            # 4. 筛选
+            df = df[df['Annualized Return %'] >= min_annualized_return]
+            df = df[df['Safety Margin %'] >= min_safety_margin]
+            
+            # 5. 展示
+            col1, col2 = st.columns(2)
+            col1.metric("当前股价", f"${current_price:.2f}")
+            col2.caption(f"数据缓存已开启。如需最新数据，请点击左侧'强制刷新'。")
+            
+            if not df.empty:
+                df = df.sort_values(by=['expiration', 'strike'], ascending=[True, False])
                 
-                if not puts.empty:
-                    all_puts.append(puts[display_cols])
-
-            progress_bar.empty()
-
-            # --- 结果展示 ---
-            if all_puts:
-                final_df = pd.concat(all_puts)
-                final_df = final_df.sort_values(by=['Expiration', 'strike'], ascending=[True, False])
-                
-                # 动态重命名列
-                final_df.columns = ['到期日', '天数', '行权价', display_premium_col, '年化收益率%', '安全边际%', '盈亏平衡点', '成交量', '未平仓']
-
-                st.success(f"✅ 基于【{display_premium_col}】计算完成，共 {len(final_df)} 个机会")
+                display_cols = ['expiration', 'dte', 'strike', 'premium', 'Annualized Return %', 'Safety Margin %', 'Break Even', 'volume', 'openInterest']
+                df_disp = df[display_cols].copy()
+                df_disp.columns = ['到期日', '天数', '行权价', disp_col, '年化收益率%', '安全边际%', '盈亏平衡点', '成交量', '未平仓']
                 
                 st.dataframe(
-                    final_df.style
+                    df_disp.style
                     .format({
                         '行权价': '{:.2f}', 
-                        display_premium_col: '{:.2f}', 
+                        disp_col: '{:.2f}', 
                         '年化收益率%': '{:.2f}', 
                         '安全边际%': '{:.2f}',
                         '盈亏平衡点': '{:.2f}',
@@ -154,7 +165,6 @@ if ticker:
                     use_container_width=True
                 )
             else:
-                st.warning(f"在当前【{display_premium_col}】下，没有找到符合筛选条件的期权。请尝试：\n1. 切换价格基准（如使用 Last）\n2. 降低目标年化收益")
-
-    except Exception as e:
-        st.error(f"发生错误: {e}")
+                st.warning("没有找到符合筛选条件的期权。尝试降低收益要求？")
+else:
+    st.info("👈 请在左侧输入代码")
